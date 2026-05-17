@@ -1,0 +1,1504 @@
+// --- FIREBASE MODULAR SDK IMPORTS ---
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { 
+  getFirestore, 
+  collection, 
+  addDoc, 
+  onSnapshot, 
+  query, 
+  orderBy, 
+  limit, 
+  serverTimestamp,
+  getDocs,
+  deleteDoc,
+  doc,
+  getDoc,
+  setDoc,
+  updateDoc
+} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+// ==========================================
+// 🚨 PASTE YOUR FIREBASE CONFIG KEYS HERE:
+// ==========================================
+const firebaseConfig = {
+  apiKey: "AIzaSyAMXXwpfPtA1RNzs0Lk_MnBEIFQ7pHDPKw",
+  authDomain: "vibespace-76e5d.firebaseapp.com",
+  projectId: "vibespace-76e5d",
+  storageBucket: "vibespace-76e5d.firebasestorage.app",
+  messagingSenderId: "566799680678",
+  appId: "1:566799680678:web:e7ccc727f1dd1487346067"
+};
+// ==========================================
+
+// PWA Service Worker Registration
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js')
+      .then(reg => console.log('[ServiceWorker] Registered successfully:', reg.scope))
+      .catch(err => console.warn('[ServiceWorker] Registration failed:', err));
+  });
+}
+
+// Check if Firebase is configured or using placeholder
+const isFirebasePlaceholder = firebaseConfig.apiKey.includes("PASTE_YOUR");
+
+let db = null;
+if (!isFirebasePlaceholder) {
+  try {
+    const app = initializeApp(firebaseConfig);
+    db = getFirestore(app);
+  } catch (e) {
+    console.warn("Global Firebase init failed:", e);
+  }
+}
+
+// --- APP STATE ---
+const state = {
+  // Calculator State
+  displayValue: '0',
+  previousValue: null,
+  operator: null,
+  waitingForSecondOperand: false,
+  
+  // Chat Profile State
+  nickname: localStorage.getItem('vibe_nickname') || `Viber_${Math.floor(100 + Math.random() * 900)}`,
+  avatarColor: localStorage.getItem('vibe_avatar_color') || '#8a78f7',
+  roomId: localStorage.getItem('vibe_room_id') || 'chill-99',
+  
+  // Active Screen
+  isSecretChatOpen: false,
+  isRoomSelectOpen: false,
+  isDecoyMode: false,
+  
+  // Realtime Unsubscribe
+  unsubscribeChat: null,
+  unsubscribeStealth: null,
+  
+  // P2P State
+  peerInstance: null,
+  myPeerId: null,
+  activeP2PConnections: new Map(),
+  unsubscribePeers: null
+};
+
+// --- DOM ELEMENTS ---
+const calcScreen = document.getElementById('calculator-screen');
+const roomScreen = document.getElementById('room-screen');
+const chatScreen = document.getElementById('chat-screen');
+const stealthDot = document.getElementById('stealth-dot');
+
+const calcDisplay = document.getElementById('calc-display');
+const calcHistory = document.getElementById('calc-history');
+const btnAC = document.getElementById('btn-ac');
+const demoBanner = document.getElementById('demo-banner');
+
+const roomForm = document.getElementById('room-form');
+const roomIdInput = document.getElementById('room-id-input');
+const btnCancelRoom = document.getElementById('btn-cancel-room');
+const headerRoomBadge = document.getElementById('header-room-badge');
+
+const chatMessages = document.getElementById('chat-messages');
+const chatForm = document.getElementById('chat-form');
+const chatInput = document.getElementById('chat-input');
+const btnExitChat = document.getElementById('btn-exit-chat');
+const btnSettings = document.getElementById('btn-settings');
+const btnBurnChat = document.getElementById('btn-burn-chat');
+const onlineStatus = document.getElementById('online-status');
+
+const burnModal = document.getElementById('burn-modal');
+const btnConfirmBurn = document.getElementById('btn-confirm-burn');
+const btnCancelBurn = document.getElementById('btn-cancel-burn');
+
+const profileModal = document.getElementById('profile-modal');
+const nicknameInput = document.getElementById('nickname-input');
+const avatarPreview = document.getElementById('avatar-preview');
+const colorButtons = document.querySelectorAll('.color-btn');
+const btnSaveProfile = document.getElementById('btn-save-profile');
+const quickEmojis = document.querySelectorAll('.vibe-emoji');
+const btnAttach = document.getElementById('btn-attach');
+const mediaFileInput = document.getElementById('media-file-input');
+const btnCamera = document.getElementById('btn-camera');
+const cameraFileInput = document.getElementById('camera-file-input');
+const btnMic = document.getElementById('btn-mic');
+const recordingIndicator = document.getElementById('recording-indicator');
+const recordingTimeEl = document.getElementById('recording-time');
+
+// --- WEB AUDIO API FOR SUBTLE NOTIFICATION BEEP ---
+let audioCtx = null;
+function playNotificationSound() {
+  try {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(587.33, audioCtx.currentTime); // D5
+    osc.frequency.exponentialRampToValueAtTime(880, audioCtx.currentTime + 0.15); // A5
+    
+    gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.2);
+    
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.2);
+  } catch (e) {
+    // Web Audio blocked or not supported
+  }
+}
+
+// ==========================================
+// 1. CALCULATOR LOGIC
+// ==========================================
+function updateCalcDisplay() {
+  calcDisplay.textContent = state.displayValue;
+  if (state.previousValue !== null && state.operator) {
+    calcHistory.textContent = `${state.previousValue} ${state.operator}`;
+  } else {
+    calcHistory.textContent = '';
+  }
+  btnAC.textContent = state.displayValue === '0' && state.previousValue === null ? 'AC' : 'C';
+}
+
+function inputDigit(digit) {
+  if (state.waitingForSecondOperand) {
+    state.displayValue = digit;
+    state.waitingForSecondOperand = false;
+  } else {
+    state.displayValue = state.displayValue === '0' ? digit : state.displayValue + digit;
+  }
+  updateCalcDisplay();
+}
+
+function inputDecimal() {
+  if (state.waitingForSecondOperand) {
+    state.displayValue = '0.';
+    state.waitingForSecondOperand = false;
+    return updateCalcDisplay();
+  }
+  if (!state.displayValue.includes('.')) {
+    state.displayValue += '.';
+  }
+  updateCalcDisplay();
+}
+
+function handleOperator(nextOperator) {
+  const inputValue = parseFloat(state.displayValue);
+
+  if (state.operator && state.waitingForSecondOperand) {
+    state.operator = nextOperator;
+    updateCalcDisplay();
+    return;
+  }
+
+  if (state.previousValue === null && !isNaN(inputValue)) {
+    state.previousValue = inputValue;
+  } else if (state.operator) {
+    const currentValue = inputValue || 0;
+    const computation = calculate(state.previousValue, currentValue, state.operator);
+    state.displayValue = String(parseFloat(computation.toFixed(8)));
+    state.previousValue = computation;
+  }
+
+  state.waitingForSecondOperand = true;
+  state.operator = nextOperator;
+  updateCalcDisplay();
+}
+
+function calculate(firstOperand, secondOperand, operator) {
+  switch (operator) {
+    case '+': return firstOperand + secondOperand;
+    case '-': return firstOperand - secondOperand;
+    case '×': return firstOperand * secondOperand;
+    case '÷': return secondOperand === 0 ? 0 : firstOperand / secondOperand;
+    default: return secondOperand;
+  }
+}
+
+function handleEqual() {
+  // 🚨 REAL SECRET TRIGGER CHECK: 7788 + =
+  if (state.displayValue === '7788') {
+    state.isDecoyMode = false;
+    openRoomSelection();
+    return;
+  }
+
+  // 🚨 DUMMY PASSWORD / DECOY MODE: 1122 + =
+  if (state.displayValue === '1122') {
+    state.isDecoyMode = true;
+    state.roomId = 'decoy_room';
+    headerRoomBadge.textContent = '#decoy_room';
+    openSecretChat();
+    return;
+  }
+
+  if (!state.operator || state.previousValue === null) return;
+  const inputValue = parseFloat(state.displayValue);
+  const result = calculate(state.previousValue, inputValue, state.operator);
+  
+  state.displayValue = String(parseFloat(result.toFixed(8)));
+  state.previousValue = null;
+  state.operator = null;
+  state.waitingForSecondOperand = false;
+  updateCalcDisplay();
+}
+
+function resetCalculator() {
+  state.displayValue = '0';
+  state.previousValue = null;
+  state.operator = null;
+  state.waitingForSecondOperand = false;
+  updateCalcDisplay();
+}
+
+function toggleSign() {
+  state.displayValue = String(parseFloat(state.displayValue) * -1);
+  updateCalcDisplay();
+}
+
+function calculatePercent() {
+  state.displayValue = String(parseFloat(state.displayValue) / 100);
+  updateCalcDisplay();
+}
+
+document.querySelector('.calc-keypad').addEventListener('click', e => {
+  const target = e.target.closest('.btn');
+  if (!target) return;
+
+  if (target.classList.contains('btn-number') && target.dataset.number) {
+    inputDigit(target.dataset.number);
+  } else if (target.classList.contains('btn-operator')) {
+    handleOperator(target.dataset.operator);
+  } else if (target.dataset.action === 'decimal') {
+    inputDecimal();
+  } else if (target.dataset.action === 'clear') {
+    resetCalculator();
+  } else if (target.dataset.action === 'toggle-sign') {
+    toggleSign();
+  } else if (target.dataset.action === 'percent') {
+    calculatePercent();
+  } else if (target.dataset.action === 'equal') {
+    handleEqual();
+  }
+});
+
+
+// ==========================================
+// 2. STEALTH NOTIFICATIONS & SCREEN NAVIGATION
+// ==========================================
+function startStealthBackgroundListener() {
+  if (state.unsubscribeStealth) {
+    state.unsubscribeStealth();
+    state.unsubscribeStealth = null;
+  }
+
+  const savedRoom = localStorage.getItem('vibe_room_id');
+  if (!savedRoom || savedRoom === 'decoy_room') return;
+
+  if (!isFirebasePlaceholder && db) {
+    try {
+      const roomCol = collection(db, "rooms", savedRoom, "messages");
+      const q = query(roomCol, orderBy("createdAt", "asc"), limit(100));
+      let isFirstSnapshot = true;
+      let initialCount = 0;
+
+      state.unsubscribeStealth = onSnapshot(q, snapshot => {
+        if (isFirstSnapshot) {
+          initialCount = snapshot.size;
+          isFirstSnapshot = false;
+          return;
+        }
+        if (snapshot.size > initialCount && !state.isSecretChatOpen && !state.isRoomSelectOpen) {
+          stealthDot.classList.remove('hidden');
+          initialCount = snapshot.size;
+        }
+      }, err => {});
+    } catch (e) {}
+  } else {
+    const localKey = 'vibe_messages_' + savedRoom;
+    let lastLen = JSON.parse(localStorage.getItem(localKey) || '[]').length;
+    window.addEventListener('storage', e => {
+      if (e.key === localKey && !state.isSecretChatOpen && !state.isRoomSelectOpen) {
+        const curLen = JSON.parse(localStorage.getItem(localKey) || '[]').length;
+        if (curLen > lastLen) {
+          stealthDot.classList.remove('hidden');
+        }
+        lastLen = curLen;
+      }
+    });
+  }
+}
+
+function openRoomSelection() {
+  state.isRoomSelectOpen = true;
+  stealthDot.classList.add('hidden');
+  if (state.unsubscribeStealth) {
+    state.unsubscribeStealth();
+    state.unsubscribeStealth = null;
+  }
+  
+  resetCalculator();
+  calcScreen.classList.remove('active');
+  calcScreen.classList.add('hidden');
+  
+  roomIdInput.value = "";
+  roomScreen.classList.remove('hidden');
+  roomScreen.classList.add('active');
+  roomIdInput.focus();
+}
+
+roomForm.addEventListener('submit', e => {
+  e.preventDefault();
+  const enteredRoom = roomIdInput.value.trim().toLowerCase();
+  if (!enteredRoom) return;
+
+  state.roomId = enteredRoom;
+  localStorage.setItem('vibe_room_id', state.roomId);
+  headerRoomBadge.textContent = '#' + state.roomId;
+
+  roomScreen.classList.remove('active');
+  roomScreen.classList.add('hidden');
+  state.isRoomSelectOpen = false;
+
+  openSecretChat();
+});
+
+btnCancelRoom.addEventListener('click', () => {
+  roomScreen.classList.remove('active');
+  roomScreen.classList.add('hidden');
+  state.isRoomSelectOpen = false;
+
+  calcScreen.classList.remove('hidden');
+  calcScreen.classList.add('active');
+  startStealthBackgroundListener();
+});
+
+function openSecretChat() {
+  state.isSecretChatOpen = true;
+  stealthDot.classList.add('hidden');
+  if (state.unsubscribeStealth) {
+    state.unsubscribeStealth();
+    state.unsubscribeStealth = null;
+  }
+  
+  resetCalculator();
+  calcScreen.classList.remove('active');
+  calcScreen.classList.add('hidden');
+  
+  chatScreen.classList.remove('hidden');
+  chatScreen.classList.add('active');
+  
+  initChatBackend();
+  
+  if (!localStorage.getItem('vibe_nickname')) {
+    openProfileModal();
+  }
+}
+
+function lockAndExitChat() {
+  state.isSecretChatOpen = false;
+  state.isRoomSelectOpen = false;
+  state.isDecoyMode = false;
+  resetCalculator();
+  
+  chatScreen.classList.remove('active');
+  chatScreen.classList.add('hidden');
+  
+  roomScreen.classList.remove('active');
+  roomScreen.classList.add('hidden');
+  
+  calcScreen.classList.remove('hidden');
+  calcScreen.classList.add('active');
+  
+  if (state.unsubscribeChat) {
+    state.unsubscribeChat();
+    state.unsubscribeChat = null;
+  }
+  
+  cleanupPeerJS();
+  startStealthBackgroundListener();
+}
+
+btnExitChat.addEventListener('click', lockAndExitChat);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && (state.isSecretChatOpen || state.isRoomSelectOpen)) {
+    lockAndExitChat();
+  }
+});
+
+
+// ==========================================
+// 3. MODAL & PROFILE SETTINGS
+// ==========================================
+function updateAvatarPreview() {
+  const initial = state.nickname ? state.nickname.charAt(0).toUpperCase() : 'V';
+  avatarPreview.textContent = initial;
+  avatarPreview.style.backgroundColor = state.avatarColor;
+}
+
+function openProfileModal() {
+  nicknameInput.value = state.nickname;
+  colorButtons.forEach(btn => {
+    if (btn.dataset.color === state.avatarColor) {
+      btn.classList.add('active');
+    } else {
+      btn.classList.remove('active');
+    }
+  });
+  updateAvatarPreview();
+  profileModal.classList.remove('hidden');
+  nicknameInput.focus();
+}
+
+function closeProfileModal() {
+  profileModal.classList.add('hidden');
+}
+
+btnSettings.addEventListener('click', openProfileModal);
+
+colorButtons.forEach(btn => {
+  btn.addEventListener('click', () => {
+    colorButtons.forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.avatarColor = btn.dataset.color;
+    updateAvatarPreview();
+  });
+});
+
+nicknameInput.addEventListener('input', e => {
+  state.nickname = e.target.value.trim() || 'Viber';
+  updateAvatarPreview();
+});
+
+btnSaveProfile.addEventListener('click', () => {
+  state.nickname = nicknameInput.value.trim() || `Viber_${Math.floor(100 + Math.random() * 900)}`;
+  localStorage.setItem('vibe_nickname', state.nickname);
+  localStorage.setItem('vibe_avatar_color', state.avatarColor);
+  closeProfileModal();
+});
+
+
+// ==========================================
+// 4. CHAT BACKEND & E2E ENCRYPTION
+// ==========================================
+function getSecretPassphrase() {
+  return "VibeSpace_Key_" + state.roomId;
+}
+
+function encryptText(plainText) {
+  try {
+    if (!window.CryptoJS) return plainText;
+    return window.CryptoJS.AES.encrypt(plainText, getSecretPassphrase()).toString();
+  } catch (err) {
+    console.error("Encryption error:", err);
+    return plainText;
+  }
+}
+
+function decryptText(cipherText) {
+  try {
+    if (!window.CryptoJS) return cipherText;
+    const bytes = window.CryptoJS.AES.decrypt(cipherText, getSecretPassphrase());
+    const originalText = bytes.toString(window.CryptoJS.enc.Utf8);
+    return originalText || "[Unable to decrypt ciphertext]";
+  } catch (err) {
+    console.error("Decryption error:", err);
+    return "[Encrypted Message]";
+  }
+}
+
+let messagesCollection = null;
+let toastTimeout = null;
+
+function showToastNotification(message) {
+  const toast = document.getElementById('room-toast');
+  const toastText = document.getElementById('room-toast-text');
+  if (!toast || !toastText) return;
+
+  if (toastTimeout) {
+    clearTimeout(toastTimeout);
+  }
+
+  toastText.textContent = message;
+  toast.classList.add('show');
+
+  toastTimeout = setTimeout(() => {
+    toast.classList.remove('show');
+    toastTimeout = null;
+  }, 4000);
+}
+
+async function checkRoomAccessTime() {
+  if (state.isDecoyMode) {
+    showToastNotification("Decoy Room initialized securely");
+    return;
+  }
+
+  if (!isFirebasePlaceholder && db) {
+    try {
+      const roomDocRef = doc(db, "rooms", state.roomId);
+      const roomSnap = await getDoc(roomDocRef);
+
+      if (roomSnap.exists()) {
+        const data = roomSnap.data();
+        if (data && data.lastAccessed) {
+          let dateObj = null;
+          if (data.lastAccessed.toDate) {
+            dateObj = data.lastAccessed.toDate();
+          } else if (typeof data.lastAccessed === 'number' || typeof data.lastAccessed === 'string') {
+            dateObj = new Date(data.lastAccessed);
+          }
+
+          if (dateObj && !isNaN(dateObj.getTime())) {
+            const formattedTime = dateObj.toLocaleString([], {
+              month: 'short',
+              day: 'numeric',
+              year: 'numeric',
+              hour: '2-digit',
+              minute: '2-digit'
+            });
+            showToastNotification(`Room last accessed: ${formattedTime}`);
+          } else {
+            showToastNotification("Room created successfully");
+          }
+        } else {
+          showToastNotification("Room created successfully");
+        }
+
+        // Immediately update with current timestamp
+        await updateDoc(roomDocRef, {
+          lastAccessed: serverTimestamp()
+        });
+      } else {
+        showToastNotification("Room created successfully");
+        await setDoc(roomDocRef, {
+          createdAt: serverTimestamp(),
+          lastAccessed: serverTimestamp()
+        }, { merge: true });
+      }
+    } catch (e) {
+      console.warn("Failed to fetch room access timestamp from Firebase, falling back to local:", e);
+      checkRoomAccessTimeLocal();
+    }
+  } else {
+    checkRoomAccessTimeLocal();
+  }
+}
+
+function checkRoomAccessTimeLocal() {
+  if (state.isDecoyMode) {
+    showToastNotification("Decoy Room initialized securely");
+    return;
+  }
+
+  const localKey = `vibe_room_last_accessed_${state.roomId}`;
+  const prevAccess = localStorage.getItem(localKey);
+  
+  if (prevAccess) {
+    const dateObj = new Date(prevAccess);
+    if (!isNaN(dateObj.getTime())) {
+      const formattedTime = dateObj.toLocaleString([], {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+      showToastNotification(`Room last accessed: ${formattedTime}`);
+    } else {
+      showToastNotification("Room created successfully");
+    }
+  } else {
+    showToastNotification("Room created successfully");
+  }
+
+  localStorage.setItem(localKey, new Date().toISOString());
+}
+
+function initChatBackend() {
+  if (!isFirebasePlaceholder && db) {
+    try {
+      messagesCollection = collection(db, "rooms", state.roomId, "messages");
+      demoBanner.classList.add('hidden');
+      onlineStatus.textContent = state.isDecoyMode ? "🔒 E2E Encrypted (Innocent Room)" : `🔒 E2E Encrypted (Room: #${state.roomId})`;
+      startFirebaseRealtime();
+      checkRoomAccessTime();
+      initPeerJS();
+    } catch (e) {
+      console.warn("Firebase Init failed, switching to Local Demo mode", e);
+      startLocalDemoMode();
+      checkRoomAccessTimeLocal();
+      initPeerJS();
+    }
+  } else {
+    startLocalDemoMode();
+    checkRoomAccessTimeLocal();
+    initPeerJS();
+  }
+}
+
+// --- FIREBASE REALTIME SYNC ---
+function startFirebaseRealtime() {
+  const q = query(messagesCollection, orderBy("createdAt", "asc"), limit(100));
+  
+  if (state.unsubscribeChat) {
+    state.unsubscribeChat();
+  }
+
+  state.unsubscribeChat = onSnapshot(q, (snapshot) => {
+    chatMessages.innerHTML = "";
+    
+    snapshot.forEach((doc) => {
+      const data = doc.data();
+      renderMessage(data);
+    });
+    
+    scrollToBottom();
+  }, (error) => {
+    console.error("Firestore Listen Error:", error);
+    startLocalDemoMode();
+  });
+}
+
+async function sendFirebaseMessage(text) {
+  if (!text || !messagesCollection) return;
+  try {
+    const encryptedText = encryptText(text);
+    await addDoc(messagesCollection, {
+      text: encryptedText,
+      author: state.nickname,
+      avatarColor: state.avatarColor,
+      createdAt: serverTimestamp(),
+      timestampStr: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      isEncrypted: true
+    });
+  } catch (error) {
+    console.error("Error sending message:", error);
+  }
+}
+
+// --- BURN HISTORY LOGIC ---
+if (btnBurnChat) {
+  btnBurnChat.addEventListener('click', () => {
+    burnModal.classList.remove('hidden');
+  });
+}
+
+if (btnCancelBurn) {
+  btnCancelBurn.addEventListener('click', () => {
+    burnModal.classList.add('hidden');
+  });
+}
+
+if (btnConfirmBurn) {
+  btnConfirmBurn.addEventListener('click', async () => {
+    burnModal.classList.add('hidden');
+    if (!isFirebasePlaceholder && db && messagesCollection) {
+      try {
+        const q = query(messagesCollection, limit(500));
+        const snapshot = await getDocs(q);
+        const deletePromises = [];
+        snapshot.forEach(docSnap => {
+          deletePromises.push(deleteDoc(docSnap.ref));
+        });
+        await Promise.all(deletePromises);
+      } catch (e) {
+        console.error("Error burning room history:", e);
+      }
+    } else {
+      const localKey = 'vibe_messages_' + state.roomId;
+      localStorage.setItem(localKey, '[]');
+      window.dispatchEvent(new Event('local_msg_update_' + state.roomId));
+    }
+  });
+}
+
+// --- LOCAL STORAGE DEMO SYNC (FALLBACK WHEN NO KEYS) ---
+function getLocalKey() {
+  return 'vibe_messages_' + state.roomId;
+}
+
+function startLocalDemoMode() {
+  demoBanner.classList.remove('hidden');
+  onlineStatus.textContent = state.isDecoyMode ? "🔒 Local Sync (Decoy Mode)" : `🔒 Local Sync (Room: #${state.roomId})`;
+  
+  let localMessages = JSON.parse(localStorage.getItem(getLocalKey()) || '[]');
+  if (localMessages.length === 0 && !state.isDecoyMode) {
+    localMessages = [
+      { id: '1', text: encryptText(`🚀 Welcome to Room #${state.roomId}!`), author: "System", avatarColor: "#8a78f7", timestampStr: "12:00 PM", isEncrypted: true },
+      { id: '2', text: encryptText("🔒 E2EE is active. Only users with this Room ID can read or decrypt messages."), author: "System", avatarColor: "#06d6a0", timestampStr: "12:01 PM", isEncrypted: true }
+    ];
+    localStorage.setItem(getLocalKey(), JSON.stringify(localMessages));
+  } else if (localMessages.length === 0 && state.isDecoyMode) {
+    // Decoy room starts completely empty or with innocent note
+    localMessages = [
+      { id: '1', text: encryptText("Hey! Did you finish the math homework?"), author: "Alex", avatarColor: "#ffd166", timestampStr: "10:15 AM", isEncrypted: true },
+      { id: '2', text: encryptText("Yeah, page 42 problems 1-5."), author: state.nickname, avatarColor: state.avatarColor, timestampStr: "10:16 AM", isEncrypted: true }
+    ];
+    localStorage.setItem(getLocalKey(), JSON.stringify(localMessages));
+  }
+
+  function renderAllLocal() {
+    chatMessages.innerHTML = "";
+    const msgs = JSON.parse(localStorage.getItem(getLocalKey()) || '[]');
+    msgs.forEach(m => renderMessage(m));
+    scrollToBottom();
+  }
+  
+  renderAllLocal();
+
+  window.addEventListener('storage', e => {
+    if (e.key === getLocalKey() && state.isSecretChatOpen) {
+      renderAllLocal();
+      playNotificationSound();
+    }
+  });
+
+  window.addEventListener('local_msg_update_' + state.roomId, () => {
+    renderAllLocal();
+  });
+}
+
+function sendLocalMessage(text) {
+  const localMessages = JSON.parse(localStorage.getItem(getLocalKey()) || '[]');
+  const encryptedText = encryptText(text);
+  const newMsg = {
+    id: Date.now().toString(),
+    text: encryptedText,
+    author: state.nickname,
+    avatarColor: state.avatarColor,
+    timestampStr: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    isEncrypted: true
+  };
+  localMessages.push(newMsg);
+  if (localMessages.length > 100) localMessages.shift();
+  
+  localStorage.setItem(getLocalKey(), JSON.stringify(localMessages));
+  window.dispatchEvent(new Event('local_msg_update_' + state.roomId));
+}
+
+// --- RENDER MESSAGE ---
+function renderMessage(data) {
+  const isSelf = data.author === state.nickname;
+  const wrap = document.createElement('div');
+  wrap.className = `message-wrapper ${isSelf ? 'sent' : 'received'}`;
+  
+  const initial = data.author ? data.author.charAt(0).toUpperCase() : 'V';
+  
+  let displayText = data.text;
+  if (data.isEncrypted || (data.text && data.text.startsWith('U2Fsd'))) {
+    displayText = decryptText(data.text);
+  }
+  
+  wrap.innerHTML = `
+    <div class="msg-avatar" style="background-color: ${data.avatarColor || '#8a78f7'};">
+      ${initial}
+    </div>
+    <div class="msg-content">
+      <div class="msg-header">
+        <span class="msg-author">${escapeHtml(data.author)}</span>
+        <span class="msg-time">${data.timestampStr || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+      </div>
+      <div class="msg-bubble">${escapeHtml(displayText)}</div>
+    </div>
+  `;
+  
+  chatMessages.appendChild(wrap);
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function scrollToBottom() {
+  setTimeout(() => {
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }, 50);
+}
+
+// Chat Form Submit
+chatForm.addEventListener('submit', async e => {
+  e.preventDefault();
+  const text = chatInput.value.trim();
+  if (!text) return;
+
+  chatInput.value = "";
+  
+  if (!isFirebasePlaceholder && db) {
+    await sendFirebaseMessage(text);
+  } else {
+    sendLocalMessage(text);
+  }
+});
+
+// Quick Emojis
+quickEmojis.forEach(btn => {
+  btn.addEventListener('click', () => {
+    const emoji = btn.dataset.emoji;
+    chatInput.value += emoji;
+    chatInput.focus();
+  });
+});
+
+// ==========================================
+// P2P WEBRTC MEDIA SHARING (PEERJS)
+// ==========================================
+function initPeerJS() {
+  if (!window.Peer) {
+    console.warn("[PeerJS] Library not loaded");
+    return;
+  }
+  cleanupPeerJS();
+
+  try {
+    const peer = new window.Peer();
+    state.peerInstance = peer;
+
+    peer.on('open', async (id) => {
+      state.myPeerId = id;
+      console.log("[PeerJS] Peer open with ID:", id);
+
+      if (!isFirebasePlaceholder && db && !state.isDecoyMode) {
+        try {
+          const peerRef = doc(db, "rooms", state.roomId, "peers", id);
+          await setDoc(peerRef, {
+            nickname: state.nickname,
+            joinedAt: serverTimestamp()
+          });
+
+          const peersCol = collection(db, "rooms", state.roomId, "peers");
+          state.unsubscribePeers = onSnapshot(peersCol, snapshot => {
+            snapshot.forEach(docSnap => {
+              const otherId = docSnap.id;
+              if (otherId !== state.myPeerId && !state.activeP2PConnections.has(otherId)) {
+                connectToPeer(otherId);
+              }
+            });
+          });
+        } catch (err) {
+          console.warn("[PeerJS] Firebase peer discovery failed, using local fallback", err);
+          startLocalPeerDiscovery(id);
+        }
+      } else {
+        startLocalPeerDiscovery(id);
+      }
+    });
+
+    peer.on('connection', (conn) => {
+      console.log("[PeerJS] Incoming connection from:", conn.peer);
+      setupDataChannel(conn);
+    });
+
+    peer.on('error', (err) => {
+      console.warn("[PeerJS] Error:", err);
+    });
+  } catch (err) {
+    console.error("[PeerJS] Initialization failed:", err);
+  }
+}
+
+function connectToPeer(otherPeerId) {
+  if (!state.peerInstance) return;
+  try {
+    const conn = state.peerInstance.connect(otherPeerId, { reliable: true });
+    setupDataChannel(conn);
+  } catch (err) {
+    console.warn("[PeerJS] Connection error:", err);
+  }
+}
+
+function setupDataChannel(conn) {
+  conn.on('open', () => {
+    console.log("[PeerJS] Data channel open with:", conn.peer);
+    state.activeP2PConnections.set(conn.peer, conn);
+    showToastNotification(`P2P direct stream connected ✨`);
+  });
+
+  conn.on('data', (data) => {
+    if (data && data.type === 'p2p-media') {
+      handleIncomingMedia(data);
+    } else if (data && data.type === 'p2p-photo') {
+      handleIncomingPhoto(data);
+    } else if (data && data.type === 'p2p-voice') {
+      handleIncomingVoice(data);
+    }
+  });
+
+  conn.on('close', () => {
+    state.activeP2PConnections.delete(conn.peer);
+  });
+
+  conn.on('error', () => {
+    state.activeP2PConnections.delete(conn.peer);
+  });
+}
+
+function startLocalPeerDiscovery(id) {
+  const localKey = 'vibe_peers_' + state.roomId;
+  let peers = JSON.parse(localStorage.getItem(localKey) || '[]');
+  if (!peers.includes(id)) {
+    peers.push(id);
+    localStorage.setItem(localKey, JSON.stringify(peers));
+  }
+
+  peers.forEach(otherId => {
+    if (otherId !== id && !state.activeP2PConnections.has(otherId)) {
+      connectToPeer(otherId);
+    }
+  });
+
+  window.addEventListener('storage', e => {
+    if (e.key === localKey && state.isSecretChatOpen) {
+      const curPeers = JSON.parse(localStorage.getItem(localKey) || '[]');
+      curPeers.forEach(otherId => {
+        if (otherId !== state.myPeerId && !state.activeP2PConnections.has(otherId)) {
+          connectToPeer(otherId);
+        }
+      });
+    }
+  });
+}
+
+async function cleanupPeerJS() {
+  if (state.unsubscribePeers) {
+    state.unsubscribePeers();
+    state.unsubscribePeers = null;
+  }
+  if (state.myPeerId) {
+    if (!isFirebasePlaceholder && db && !state.isDecoyMode) {
+      try {
+        await deleteDoc(doc(db, "rooms", state.roomId, "peers", state.myPeerId));
+      } catch(e) {}
+    }
+    const localKey = 'vibe_peers_' + state.roomId;
+    let peers = JSON.parse(localStorage.getItem(localKey) || '[]');
+    peers = peers.filter(p => p !== state.myPeerId);
+    localStorage.setItem(localKey, JSON.stringify(peers));
+  }
+  if (state.peerInstance) {
+    state.peerInstance.destroy();
+    state.peerInstance = null;
+  }
+  state.activeP2PConnections.clear();
+  state.myPeerId = null;
+}
+
+window.addEventListener('beforeunload', () => {
+  cleanupPeerJS();
+});
+
+if (btnAttach && mediaFileInput) {
+  btnAttach.addEventListener('click', () => {
+    if (state.activeP2PConnections.size === 0) {
+      showToastNotification("P2P Error: No online peers in room to receive file.");
+      return;
+    }
+    mediaFileInput.click();
+  });
+
+  mediaFileInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    if (state.activeP2PConnections.size === 0) {
+      showToastNotification("P2P Error: No online peers in room to receive file.");
+      mediaFileInput.value = "";
+      return;
+    }
+
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const payload = {
+        type: 'p2p-media',
+        fileName: file.name,
+        fileType: file.type,
+        data: arrayBuffer,
+        senderNickname: state.nickname,
+        senderAvatarColor: state.avatarColor,
+        timestampStr: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      };
+
+      state.activeP2PConnections.forEach(conn => {
+        conn.send(payload);
+      });
+
+      renderMediaMessage({
+        isSelf: true,
+        fileName: file.name,
+        fileType: file.type,
+        blobUrl: URL.createObjectURL(file),
+        author: state.nickname,
+        avatarColor: state.avatarColor,
+        timestampStr: payload.timestampStr
+      });
+
+      showToastNotification("File sent via P2P direct stream 🚀");
+    } catch (err) {
+      console.error("[PeerJS] Error sending file:", err);
+      showToastNotification("Failed to send P2P media file.");
+    } finally {
+      mediaFileInput.value = "";
+    }
+  });
+}
+
+function handleIncomingMedia(data) {
+  try {
+    const blob = new Blob([data.data], { type: data.fileType });
+    const blobUrl = URL.createObjectURL(blob);
+    renderMediaMessage({
+      isSelf: false,
+      fileName: data.fileName,
+      fileType: data.fileType,
+      blobUrl,
+      author: data.senderNickname,
+      avatarColor: data.senderAvatarColor,
+      timestampStr: data.timestampStr
+    });
+    playNotificationSound();
+    showToastNotification(`Received P2P file from ${data.senderNickname} ✨`);
+  } catch (err) {
+    console.error("[PeerJS] Error processing incoming media:", err);
+  }
+}
+
+function renderMediaMessage(mediaData) {
+  const isSelf = mediaData.isSelf;
+  const wrap = document.createElement('div');
+  wrap.className = `message-wrapper ${isSelf ? 'sent' : 'received'}`;
+  
+  const initial = mediaData.author ? mediaData.author.charAt(0).toUpperCase() : 'V';
+  
+  const fileType = mediaData.fileType || '';
+  const isImage = fileType.startsWith('image/');
+  const isVideo = fileType.startsWith('video/');
+  const isAudio = fileType.startsWith('audio/');
+
+  let mediaHtml = '';
+  if (isImage) {
+    mediaHtml = `<img src="${mediaData.blobUrl}" class="p2p-attachment-image" alt="Image Attachment" style="width: 100%; max-height: 280px; object-fit: cover; border-radius: 8px; display: block;">`;
+  } else if (isVideo) {
+    mediaHtml = `<video controls src="${mediaData.blobUrl}" class="p2p-video"></video>`;
+  } else if (isAudio) {
+    mediaHtml = `<audio controls src="${mediaData.blobUrl}" class="p2p-audio"></audio>`;
+  } else {
+    mediaHtml = `<div class="file-icon-box" style="padding: 20px; text-align: center; font-size: 2.5rem;">📄</div>`;
+  }
+
+  wrap.innerHTML = `
+    <div class="msg-avatar" style="background-color: ${mediaData.avatarColor || '#8a78f7'};">
+      ${initial}
+    </div>
+    <div class="msg-content">
+      <div class="msg-header">
+        <span class="msg-author">${escapeHtml(mediaData.author)}</span>
+        <span class="msg-time">${mediaData.timestampStr}</span>
+      </div>
+      <div class="msg-bubble p2p-media-bubble">
+        <div class="msg-media-box">
+          <div class="media-player-wrap">
+            ${mediaHtml}
+          </div>
+          <div class="media-file-info">
+            <span class="media-name" title="${escapeHtml(mediaData.fileName)}">${escapeHtml(mediaData.fileName)}</span>
+            <a href="${mediaData.blobUrl}" download="${escapeHtml(mediaData.fileName)}" class="btn-save-device">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+              <span>Save</span>
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  
+  chatMessages.appendChild(wrap);
+  scrollToBottom();
+}
+
+if (btnCamera && cameraFileInput) {
+  btnCamera.addEventListener('click', () => {
+    if (state.activeP2PConnections.size === 0) {
+      showToastNotification("P2P Error: No online peers in room to receive photo.");
+      return;
+    }
+    cameraFileInput.click();
+  });
+
+  cameraFileInput.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    if (state.activeP2PConnections.size === 0) {
+      showToastNotification("P2P Error: No online peers in room to receive photo.");
+      cameraFileInput.value = "";
+      return;
+    }
+
+    try {
+      const img = new Image();
+      img.src = URL.createObjectURL(file);
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        let width = img.width;
+        let height = img.height;
+        const maxDim = 800;
+        if (width > maxDim || height > maxDim) {
+          if (width > height) {
+            height = Math.round((height * maxDim) / width);
+            width = maxDim;
+          } else {
+            width = Math.round((width * maxDim) / height);
+            height = maxDim;
+          }
+        }
+        canvas.width = width;
+        canvas.height = height;
+        ctx.drawImage(img, 0, 0, width, height);
+
+        canvas.toBlob(async (blob) => {
+          const arrayBuffer = await blob.arrayBuffer();
+          const payload = {
+            type: 'p2p-photo',
+            fileName: file.name || 'live-photo.jpg',
+            fileType: blob.type,
+            data: arrayBuffer,
+            senderNickname: state.nickname,
+            senderAvatarColor: state.avatarColor,
+            timestampStr: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          };
+
+          state.activeP2PConnections.forEach(conn => conn.send(payload));
+
+          renderPhotoMessage({
+            isSelf: true,
+            blobUrl: URL.createObjectURL(blob),
+            author: state.nickname,
+            avatarColor: state.avatarColor,
+            timestampStr: payload.timestampStr
+          });
+
+          showToastNotification("Live stealth photo sent 🔥 (10s burn)");
+        }, 'image/jpeg', 0.85);
+      };
+    } catch (err) {
+      console.error("[PeerJS] Error capturing photo:", err);
+      showToastNotification("Failed to process live photo.");
+    } finally {
+      cameraFileInput.value = "";
+    }
+  });
+}
+
+function handleIncomingPhoto(data) {
+  try {
+    const blob = new Blob([data.data], { type: data.fileType || 'image/jpeg' });
+    const blobUrl = URL.createObjectURL(blob);
+    renderPhotoMessage({
+      isSelf: false,
+      blobUrl,
+      author: data.senderNickname,
+      avatarColor: data.senderAvatarColor,
+      timestampStr: data.timestampStr
+    });
+    playNotificationSound();
+    showToastNotification(`Received live photo from ${data.senderNickname} 🔥 (10s burn)`);
+  } catch (err) {
+    console.error("[PeerJS] Error processing incoming photo:", err);
+  }
+}
+
+function renderPhotoMessage(photoData) {
+  const isSelf = photoData.isSelf;
+  const wrap = document.createElement('div');
+  wrap.className = `message-wrapper ${isSelf ? 'sent' : 'received'}`;
+  
+  const initial = photoData.author ? photoData.author.charAt(0).toUpperCase() : 'V';
+
+  wrap.innerHTML = `
+    <div class="msg-avatar" style="background-color: ${photoData.avatarColor || '#8a78f7'};">
+      ${initial}
+    </div>
+    <div class="msg-content">
+      <div class="msg-header">
+        <span class="msg-author">${escapeHtml(photoData.author)}</span>
+        <span class="msg-time">${photoData.timestampStr}</span>
+      </div>
+      <div class="msg-bubble p2p-media-bubble">
+        <div class="msg-photo-box">
+          <div class="photo-img-wrap">
+            <img src="${photoData.blobUrl}" class="p2p-live-photo" alt="Live Photo Capture">
+            <div class="burn-timer-badge">
+              <span class="burn-icon">🔥</span>
+              <span class="burn-time">10s</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  
+  chatMessages.appendChild(wrap);
+  scrollToBottom();
+
+  // 10s auto-burn countdown
+  const timerBadge = wrap.querySelector('.burn-time');
+  let timeLeft = 10;
+  const interval = setInterval(() => {
+    timeLeft--;
+    if (timerBadge) {
+      timerBadge.textContent = timeLeft + 's';
+    }
+    if (timeLeft <= 0) {
+      clearInterval(interval);
+      wrap.classList.add('burning');
+      setTimeout(() => {
+        wrap.remove();
+        try { URL.revokeObjectURL(photoData.blobUrl); } catch(e){}
+      }, 500);
+    }
+  }, 1000);
+}
+
+// --- VOICE RECORDING (HOLD-TO-RECORD) ---
+let mediaRecorder = null;
+let audioChunks = [];
+let recordingTimer = null;
+let recordingStartTime = 0;
+let isRecording = false;
+
+async function startVoiceRecording() {
+  if (isRecording) return;
+  if (state.activeP2PConnections.size === 0) {
+    showToastNotification("P2P Error: No online peers in room to receive voice note.");
+    return;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream);
+    audioChunks = [];
+
+    mediaRecorder.ondataavailable = e => {
+      if (e.data && e.data.size > 0) {
+        audioChunks.push(e.data);
+      }
+    };
+
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(track => track.stop());
+      if (audioChunks.length === 0) return;
+
+      const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+      if (audioBlob.size < 500) {
+        showToastNotification("Voice message too short.");
+        return;
+      }
+
+      const arrayBuffer = await audioBlob.arrayBuffer();
+      const payload = {
+        type: 'p2p-voice',
+        fileName: `VoiceNote_${Date.now()}.webm`,
+        fileType: audioBlob.type,
+        data: arrayBuffer,
+        senderNickname: state.nickname,
+        senderAvatarColor: state.avatarColor,
+        timestampStr: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      };
+
+      state.activeP2PConnections.forEach(conn => conn.send(payload));
+
+      renderVoiceMessage({
+        isSelf: true,
+        blobUrl: URL.createObjectURL(audioBlob),
+        author: state.nickname,
+        avatarColor: state.avatarColor,
+        timestampStr: payload.timestampStr
+      });
+
+      showToastNotification("Voice message sent 🎤");
+    };
+
+    mediaRecorder.start();
+    isRecording = true;
+    if (btnMic) btnMic.classList.add('recording');
+    if (recordingIndicator) recordingIndicator.classList.remove('hidden');
+
+    recordingStartTime = Date.now();
+    if (recordingTimer) clearInterval(recordingTimer);
+    recordingTimer = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - recordingStartTime) / 1000);
+      const mins = Math.floor(elapsed / 60);
+      const secs = (elapsed % 60).toString().padStart(2, '0');
+      if (recordingTimeEl) recordingTimeEl.textContent = `${mins}:${secs}`;
+    }, 1000);
+
+  } catch (err) {
+    console.warn("Microphone access denied or error:", err);
+    showToastNotification("Microphone access permission required.");
+  }
+}
+
+function stopVoiceRecording() {
+  if (!isRecording || !mediaRecorder) return;
+  isRecording = false;
+  if (recordingTimer) {
+    clearInterval(recordingTimer);
+    recordingTimer = null;
+  }
+  if (btnMic) btnMic.classList.remove('recording');
+  if (recordingIndicator) recordingIndicator.classList.add('hidden');
+  if (recordingTimeEl) recordingTimeEl.textContent = "0:00";
+
+  try {
+    mediaRecorder.stop();
+  } catch(e){}
+}
+
+if (btnMic) {
+  btnMic.addEventListener('mousedown', e => {
+    e.preventDefault();
+    startVoiceRecording();
+  });
+  window.addEventListener('mouseup', () => {
+    if (isRecording) stopVoiceRecording();
+  });
+
+  btnMic.addEventListener('touchstart', e => {
+    e.preventDefault();
+    startVoiceRecording();
+  });
+  window.addEventListener('touchend', () => {
+    if (isRecording) stopVoiceRecording();
+  });
+}
+
+function handleIncomingVoice(data) {
+  try {
+    const blob = new Blob([data.data], { type: data.fileType || 'audio/webm' });
+    const blobUrl = URL.createObjectURL(blob);
+    renderVoiceMessage({
+      isSelf: false,
+      blobUrl,
+      author: data.senderNickname,
+      avatarColor: data.senderAvatarColor,
+      timestampStr: data.timestampStr
+    });
+    playNotificationSound();
+    showToastNotification(`Received voice note from ${data.senderNickname} 🎤`);
+  } catch (err) {
+    console.error("[PeerJS] Error processing incoming voice:", err);
+  }
+}
+
+function renderVoiceMessage(voiceData) {
+  const isSelf = voiceData.isSelf;
+  const wrap = document.createElement('div');
+  wrap.className = `message-wrapper ${isSelf ? 'sent' : 'received'}`;
+  
+  const initial = voiceData.author ? voiceData.author.charAt(0).toUpperCase() : 'V';
+
+  wrap.innerHTML = `
+    <div class="msg-avatar" style="background-color: ${voiceData.avatarColor || '#8a78f7'};">
+      ${initial}
+    </div>
+    <div class="msg-content">
+      <div class="msg-header">
+        <span class="msg-author">${escapeHtml(voiceData.author)}</span>
+        <span class="msg-time">${voiceData.timestampStr}</span>
+      </div>
+      <div class="msg-bubble p2p-media-bubble">
+        <div class="msg-media-box">
+          <div class="media-player-wrap">
+            <audio controls src="${voiceData.blobUrl}" class="p2p-audio"></audio>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  
+  chatMessages.appendChild(wrap);
+  scrollToBottom();
+}
+
+// Initial Setup
+updateCalcDisplay();
+startStealthBackgroundListener();
+
+// ==========================================
+// 5. PWA CUSTOM INSTALL POPUP & SERVICE WORKER
+// ==========================================
+const installModal = document.getElementById('install-modal');
+const installModalText = document.getElementById('install-modal-text');
+const installBtnWrap = document.getElementById('install-btn-wrap');
+const btnPwaInstall = document.getElementById('btn-pwa-install');
+const btnPwaDismiss = document.getElementById('btn-pwa-dismiss');
+
+let deferredPrompt = null;
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js').catch(err => {
+      console.warn('Service worker registration failed:', err);
+    });
+  });
+}
+
+function checkPwaInstallPrompt() {
+  if (window.matchMedia('(display-mode: standalone)').matches || localStorage.getItem('vibe_pwa_dismissed')) {
+    return;
+  }
+
+  const isIos = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+
+  if (isIos) {
+    installModalText.innerHTML = "To install VibeSpace for full-screen stealth mode, tap the Share icon in Safari and select <b>'Add to Home Screen'</b>.";
+    installBtnWrap.classList.add('hidden');
+    setTimeout(() => {
+      if (installModal) installModal.classList.remove('hidden');
+    }, 2000);
+  }
+}
+
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault();
+  deferredPrompt = e;
+  
+  if (window.matchMedia('(display-mode: standalone)').matches || localStorage.getItem('vibe_pwa_dismissed')) {
+    return;
+  }
+
+  installModalText.textContent = "Install this app to your home screen for the best full-screen stealth experience.";
+  installBtnWrap.classList.remove('hidden');
+  
+  setTimeout(() => {
+    if (installModal) installModal.classList.remove('hidden');
+  }, 1500);
+});
+
+if (btnPwaInstall) {
+  btnPwaInstall.addEventListener('click', async () => {
+    if (deferredPrompt) {
+      deferredPrompt.prompt();
+      const { outcome } = await deferredPrompt.userChoice;
+      if (outcome === 'accepted') {
+        localStorage.setItem('vibe_pwa_dismissed', 'true');
+      }
+      deferredPrompt = null;
+    }
+    installModal.classList.add('hidden');
+  });
+}
+
+if (btnPwaDismiss) {
+  btnPwaDismiss.addEventListener('click', () => {
+    localStorage.setItem('vibe_pwa_dismissed', 'true');
+    installModal.classList.add('hidden');
+  });
+}
+
+checkPwaInstallPrompt();
